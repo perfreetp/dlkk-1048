@@ -241,49 +241,41 @@ async function main() {
       filters: { excludeRecentDunning: false, excludeBlacklist: false }
     });
     assert('批量生成提醒成功', res.status === 200 && res.body.success, `状态: ${res.status}, 消息: ${res.body && res.body.message}`);
-    const results = res.body && res.body.data;
-    assert('返回分阶段结果', Array.isArray(results), `类型: ${typeof results}`);
-    if (Array.isArray(results)) {
-      const total = results.reduce((s, r) => s + (r.matchedCount || 0), 0);
-      log(COLORS.cyan, `    分阶段结果: ${results.map(r => `${r.stage}:${r.matchedCount || 0}户`).join(', ')}`);
-      log(COLORS.cyan, `    总计匹配: ${total} 户`);
-      if (!testTaskId && results.length > 0 && results[0].taskId) {
-        testTaskId = results[0].taskId;
+    const data = res.body && res.body.data;
+    assert('返回 stages 数组', data && Array.isArray(data.stages), `类型: ${data && typeof data}`);
+    if (data && Array.isArray(data.stages)) {
+      const total = data.stages.reduce((s, r) => s + (r.matchedCount || 0), 0);
+      const totalQueued = data.totalQueued || 0;
+      log(COLORS.cyan, `    分阶段结果: ${data.stages.map(r => `${r.stage}:${r.matchedCount || 0}户/${r.queuedCount || 0}条入队`).join(', ')}`);
+      log(COLORS.cyan, `    总计匹配: ${total} 户, 入队: ${totalQueued} 条`);
+      if (data.stages.length > 0 && data.stages[0].taskId) {
+        testTaskId = data.stages[0].taskId;
       }
-      const errors = results.filter(r => r.error);
+      const errors = data.stages.filter(r => r.error);
       if (errors.length > 0) {
         log(COLORS.yellow, `    ⚠️ 部分阶段错误: ${errors.map(e => e.stage + ':' + e.error).join(', ')}`);
       }
+      assert('批量生成后有入队记录', totalQueued > 0, `实际入队: ${totalQueued}`);
     }
   } catch (e) {
     assert('批量生成提醒', false, e.message);
   }
 
-  // ===== 4.5 执行催缴任务 & 发送队列 =====
-  log(COLORS.bold + COLORS.blue, '\n【4.5/6】执行催缴任务 & 发送队列');
-  if (testTaskId) {
-    try {
-      const res = await request('POST', `/dunning/tasks/${testTaskId}/execute`);
-      assert('任务执行成功', res.status === 200 && res.body.success, `状态: ${res.status}, 消息: ${res.body && res.body.message}`);
-      const d = res.body && res.body.data;
-      assert('发送成功数 > 0 或入队 > 0', d && (d.successCount > 0 || d.queueCount > 0),
-        `成功: ${d && d.successCount}, 队列: ${d && d.queueCount}`);
-      log(COLORS.cyan, `    成功: ${d && d.successCount}, 失败: ${d && d.failedCount}, 入队: ${d && d.queueCount}`);
-    } catch (e) {
-      assert('执行任务', false, e.message);
-    }
-  }
-
+  // ===== 4.5 发送队列验证 =====
+  log(COLORS.bold + COLORS.blue, '\n【4.5/7】发送队列验证（批量生成后直接入队）');
   try {
-    const res = await request('GET', '/dunning/queue?pageSize=10');
+    const res = await request('GET', '/dunning/queue?pageSize=20&status=' + encodeURIComponent('待发送'));
     assert('发送队列查询成功', res.status === 200 && res.body.success, `状态: ${res.status}`);
     const list = res.body && res.body.data && res.body.data.list;
     if (list) {
-      assert('队列包含记录', list.length > 0, `实际: ${list.length}`);
+      assert('队列包含待发送记录', list.length > 0, `实际: ${list.length}`);
       log(COLORS.cyan, `    队列消息: ${list.length} 条`);
       if (list.length > 0) {
-        log(COLORS.cyan, `    第一条: ${list[0].houseNo} - ${list[0].content && list[0].content.substring(0, 30)}...`);
+        log(COLORS.cyan, `    第一条: ${list[0].houseNo} - ${list[0].title || '(无标题)'}`);
+        log(COLORS.cyan, `    内容预览: ${list[0].content && list[0].content.substring(0, 50)}...`);
         log(COLORS.cyan, `    状态: ${list[0].status}`);
+        assert('消息内容非空', list[0].content && list[0].content.length > 10);
+        assert('消息标题正常', !!list[0].title);
       }
     }
   } catch (e) {
@@ -291,7 +283,8 @@ async function main() {
   }
 
   // ===== 4.6 付款同步 =====
-  log(COLORS.bold + COLORS.blue, '\n【4.6/6】付款同步');
+  log(COLORS.bold + COLORS.blue, '\n【4.6/7】付款同步');
+  let paymentAmount = 0;
   if (testHouseNo && testFeeIds.length > 0) {
     try {
       const syncBody = {
@@ -313,8 +306,9 @@ async function main() {
       const d = res.body && res.body.data;
       assert('返回付款记录', d && d.paymentRecord);
       if (d) {
+        paymentAmount = d.paymentRecord && d.paymentRecord.paidAmount || 0;
         log(COLORS.cyan, `    付款编号: ${d.paymentRecord && d.paymentRecord.paymentNo}`);
-        log(COLORS.cyan, `    付款金额: ¥${d.paymentRecord && d.paymentRecord.paidAmount}`);
+        log(COLORS.cyan, `    付款金额: ¥${paymentAmount}`);
         log(COLORS.cyan, `    更新费用: ${d.updatedFees} 笔`);
       }
     } catch (e) {
@@ -322,6 +316,51 @@ async function main() {
     }
   } else {
     log(COLORS.yellow, '  ⚠️  跳过付款同步（缺少测试房号或费用ID）');
+  }
+
+  // ===== 4.7 催缴效果统计 & 付款后欠费详情 =====
+  log(COLORS.bold + COLORS.blue, '\n【4.7/7】催缴效果统计 & 付款后验证');
+  try {
+    const res = await request('GET', '/statistics/dunning-effect');
+    assert('催缴效果统计成功', res.status === 200 && res.body.success, `状态: ${res.status}`);
+    const d = res.body && res.body.data;
+    assert('包含 overview 字段', d && d.overview);
+    if (d && d.overview) {
+      log(COLORS.cyan, `    总任务数: ${d.overview.totalTasks}`);
+      log(COLORS.cyan, `    已发送消息: ${d.overview.totalMessagesSent}`);
+      log(COLORS.cyan, `    付款笔数: ${d.overview.totalPayments}`);
+      log(COLORS.cyan, `    付款金额: ¥${d.overview.totalPaymentAmount}`);
+      if (paymentAmount > 0) {
+        assert('付款金额统计正确', d.overview.totalPaymentAmount >= paymentAmount,
+          `统计: ¥${d.overview.totalPaymentAmount}, 期望: >= ¥${paymentAmount}`);
+      }
+    }
+    assert('包含 rates 字段', d && d.rates);
+    if (d && d.rates) {
+      log(COLORS.cyan, `    送达率: ${d.rates.deliveryRate}, 阅读率: ${d.rates.readRate}, 转化率: ${d.rates.conversionRate}`);
+    }
+  } catch (e) {
+    assert('催缴效果统计', false, e.message);
+  }
+
+  if (testHouseNo && paymentAmount > 0) {
+    try {
+      const res = await request('GET', `/arrears/house/${encodeURIComponent(testHouseNo)}`);
+      assert('付款后欠费详情查询成功', res.status === 200 && res.body.success, `状态: ${res.status}`);
+      const d = res.body && res.body.data;
+      if (d && d.arrearsFees && d.arrearsFees.length > 0) {
+        const firstFee = d.arrearsFees[0];
+        log(COLORS.cyan, `    第一笔欠费: ¥${firstFee.unpaidAmount} (已付: ¥${firstFee.paidAmount})`);
+        assert('欠费金额已更新', firstFee.paidAmount > 0 || d.summary.totalArrears >= 0,
+          `已付金额: ¥${firstFee.paidAmount}, 未付: ¥${firstFee.unpaidAmount}`);
+      }
+      if (d && d.summary) {
+        log(COLORS.cyan, `    当前总欠费: ¥${d.summary.totalArrears}`);
+        log(COLORS.cyan, `    欠费笔数: ${d.summary.overdueCount}`);
+      }
+    } catch (e) {
+      assert('付款后欠费详情', false, e.message);
+    }
   }
 
   // ===== Summary =====

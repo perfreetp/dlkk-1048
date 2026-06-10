@@ -512,6 +512,7 @@ const batchGenerateReminders = async (filters, dunningType, operator) => {
   ];
 
   const results = [];
+  let totalQueued = 0;
 
   for (const stage of stageFilters) {
     try {
@@ -531,7 +532,7 @@ const batchGenerateReminders = async (filters, dunningType, operator) => {
         }
       }
 
-      const result = await createDunningTask({
+      const createResult = await createDunningTask({
         taskName: `${stage.name}${dunningType}批量催缴-${moment().format('YYYY-MM-DD HH:mm')}`,
         taskType: '自动',
         dunningType,
@@ -544,11 +545,23 @@ const batchGenerateReminders = async (filters, dunningType, operator) => {
         }
       }, operator);
 
+      const task = createResult.task;
+      let queuedCount = 0;
+
+      try {
+        const execResult = await executeDunningTask(task._id, operator);
+        queuedCount = execResult.successCount || 0;
+        totalQueued += queuedCount;
+      } catch (execErr) {
+        logger.warn(`批量催缴-${stage.name}任务执行失败: ${execErr.message}`);
+      }
+
       results.push({
         stage: stage.name,
-        taskNo: result.task.taskNo,
-        taskId: result.task._id,
-        matchedCount: result.matchedCount,
+        taskNo: task.taskNo,
+        taskId: task._id,
+        matchedCount: createResult.matchedCount,
+        queuedCount,
         templateName: template.templateName,
         success: true
       });
@@ -564,13 +577,19 @@ const batchGenerateReminders = async (filters, dunningType, operator) => {
           stage: stage.name,
           success: true,
           matchedCount: 0,
+          queuedCount: 0,
           note: error.message || '无符合条件数据'
         });
       }
     }
   }
 
-  return results;
+  return {
+    stages: results,
+    totalStages: results.length,
+    successStages: results.filter(r => r.success).length,
+    totalQueued
+  };
 };
 
 const getMessageQueue = async (params) => {

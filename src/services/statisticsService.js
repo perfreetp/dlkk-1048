@@ -89,7 +89,7 @@ const getDunningEffectStatistics = async (params) => {
       totalMessagesRead,
       totalMessagesReplied,
       totalPayments,
-      totalPaymentAmount: totalPayments[0]?.total || 0,
+      totalPaymentAmount: totalPaymentAmount.length > 0 ? totalPaymentAmount[0].total : 0,
       totalReductions,
       totalReductionAmount: totalReductionAmount[0]?.total || 0
     },
