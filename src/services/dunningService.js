@@ -24,10 +24,13 @@ const { logOperation } = require('../middleware');
 const getTemplates = async (params) => {
   const { page, pageSize, skip } = parsePageParams(params);
   const sort = buildSortParams(params.sortBy, params.sortOrder);
-  const query = {};
+  const query = { isEnabled: true };
 
-  if (params.templateType) {
-    query.templateType = params.templateType;
+  if (params.channel || params.templateType) {
+    query.$or = [
+      { channel: params.channel || params.templateType },
+      { templateType: params.channel || params.templateType }
+    ];
   }
   if (params.dunningStage) {
     query.dunningStage = params.dunningStage;
@@ -41,6 +44,7 @@ const getTemplates = async (params) => {
   if (params.keyword) {
     query.$or = [
       { templateName: { $regex: params.keyword, $options: 'i' } },
+      { templateCode: { $regex: params.keyword, $options: 'i' } },
       { title: { $regex: params.keyword, $options: 'i' } }
     ];
   }
@@ -63,54 +67,68 @@ const getTemplateById = async (templateId) => {
 
 const selectTemplate = async (dunningType, dunningStage, overdueLevel) => {
   const query = {
-    templateType: dunningType,
     dunningStage,
-    isEnabled: true
+    isEnabled: true,
+    $or: [
+      { channel: dunningType },
+      { templateType: dunningType }
+    ]
   };
 
   if (overdueLevel) {
-    query.$or = [
-      { overdueLevel },
-      { overdueLevel: { $exists: false } }
-    ];
+    query.overdueLevel = overdueLevel;
   }
 
-  const templates = await DunningTemplate.find(query).sort({ priority: -1, isDefault: -1 });
+  let templates = await DunningTemplate.find(query).sort({ priority: -1, isDefault: -1 });
+
+  if (templates.length === 0 && overdueLevel) {
+    delete query.overdueLevel;
+    templates = await DunningTemplate.find(query).sort({ priority: -1, isDefault: -1 });
+  }
 
   if (templates.length === 0) {
-    throw new NotFoundError('未找到匹配的催缴模板');
+    throw new NotFoundError(`未找到匹配的催缴模板（${dunningType} / ${dunningStage} / ${overdueLevel || '任意等级'}）`);
   }
 
   return templates[0];
 };
 
 const renderTemplate = (template, data) => {
-  let content = template.content;
-  const variables = template.variables || [];
+  let content = template.content || '';
+  let title = template.title || template.templateName || '';
 
-  for (const variable of variables) {
-    const value = data[variable.name] || '';
-    const regex = new RegExp(`\\{\\{\\s*${variable.name}\\s*\\}\\}`, 'g');
-    content = content.replace(regex, value);
+  const varMap = {};
+  if (template.variables && Array.isArray(template.variables)) {
+    for (const v of template.variables) {
+      const name = typeof v === 'string' ? v : v.name;
+      varMap[name] = name;
+    }
   }
 
-  let title = template.title;
-  for (const variable of variables) {
-    const value = data[variable.name] || '';
-    const regex = new RegExp(`\\{\\{\\s*${variable.name}\\s*\\}\\}`, 'g');
-    title = title.replace(regex, value);
+  for (const [key, value] of Object.entries(data)) {
+    const displayValue = value === null || value === undefined ? '' : String(value);
+    const regex1 = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'g');
+    const regex2 = new RegExp(`\\{${key}\\}`, 'g');
+    content = content.replace(regex1, displayValue).replace(regex2, displayValue);
+    title = title.replace(regex1, displayValue).replace(regex2, displayValue);
+
+    if (varMap[key]) {
+      const regex3 = new RegExp(`\\{${varMap[key]}\\}`, 'g');
+      content = content.replace(regex3, displayValue);
+      title = title.replace(regex3, displayValue);
+    }
   }
 
   return { title, content };
 };
 
 const checkDunningEligibility = async (houseId, filters = {}) => {
-  const house = await House.findById(houseId).populate('residentId');
+  const house = await House.findById(houseId);
   if (!house) {
     return { eligible: false, reason: '房屋不存在' };
   }
 
-  const resident = house.residentId;
+  const resident = await Resident.findOne({ houseId: house._id });
 
   if (filters.excludeBlacklist !== false && resident && resident.isBlacklist) {
     return { eligible: false, reason: '黑名单用户' };
@@ -126,6 +144,9 @@ const checkDunningEligibility = async (houseId, filters = {}) => {
       return { eligible: false, reason: '存在未处理投诉' };
     }
   }
+  if (resident && resident.isInComplaintHandling) {
+    return { eligible: false, reason: '投诉处理中' };
+  }
 
   if (filters.excludePromised && resident && resident.promisedPaymentDate) {
     if (moment(resident.promisedPaymentDate).isAfter(moment())) {
@@ -134,7 +155,7 @@ const checkDunningEligibility = async (houseId, filters = {}) => {
   }
 
   if (filters.excludeRecentDunning !== false) {
-    const cooldownHours = config.dunning.cooldownHours;
+    const cooldownHours = config.dunning.cooldownHours || 24;
     const cutoffTime = moment().subtract(cooldownHours, 'hours').toDate();
     const recentMessages = await MessageQueue.findOne({
       houseId,
@@ -156,7 +177,7 @@ const checkDunningEligibility = async (houseId, filters = {}) => {
 const buildTaskFilters = async (filters) => {
   const feeQuery = {
     unpaidAmount: { $gt: 0 },
-    paymentStatus: { $in: ['未缴', '部分缴'] }
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] }
   };
 
   if (filters.houseNos && filters.houseNos.length > 0) {
@@ -175,25 +196,29 @@ const buildTaskFilters = async (filters) => {
     feeQuery.overdueDays = { $gte: filters.minOverdueDays };
   }
   if (filters.maxOverdueDays !== undefined) {
-    feeQuery.overdueDays = { ...feeQuery.overdueDays, $lte: filters.maxOverdueDays };
+    feeQuery.overdueDays = { ...(feeQuery.overdueDays || {}), $lte: filters.maxOverdueDays };
   }
 
   if (filters.minArrearsAmount !== undefined) {
     feeQuery.unpaidAmount = { $gte: filters.minArrearsAmount };
   }
   if (filters.maxArrearsAmount !== undefined) {
-    feeQuery.unpaidAmount = { ...feeQuery.unpaidAmount, $lte: filters.maxArrearsAmount };
+    feeQuery.unpaidAmount = { ...(feeQuery.unpaidAmount || {}), $lte: filters.maxArrearsAmount };
   }
 
-  const fees = await PropertyFee.find(feeQuery).populate('houseId').populate('residentId');
+  const fees = await PropertyFee.find(feeQuery).populate('houseId');
 
   const houseFeeMap = new Map();
   for (const fee of fees) {
-    const houseId = fee.houseId ? fee.houseId._id.toString() : fee.houseId;
+    const house = fee.houseId;
+    if (!house) continue;
+    const houseId = house._id.toString();
+
     if (!houseFeeMap.has(houseId)) {
+      const resident = await Resident.findOne({ houseId: house._id });
       houseFeeMap.set(houseId, {
-        house: fee.houseId,
-        resident: fee.residentId,
+        house,
+        resident,
         fees: [],
         totalArrears: 0,
         maxOverdueDays: 0
@@ -201,7 +226,7 @@ const buildTaskFilters = async (filters) => {
     }
     const entry = houseFeeMap.get(houseId);
     entry.fees.push(fee);
-    entry.totalArrears += fee.unpaidAmount;
+    entry.totalArrears = Number((entry.totalArrears + fee.unpaidAmount).toFixed(2));
     entry.maxOverdueDays = Math.max(entry.maxOverdueDays, fee.overdueDays || 0);
   }
 
@@ -209,7 +234,7 @@ const buildTaskFilters = async (filters) => {
   for (const [houseId, entry] of houseFeeMap) {
     if (!entry.house) continue;
 
-    const eligibility = await checkDunningEligibility(houseId, filters);
+    const eligibility = await checkDunningEligibility(entry.house._id, filters);
     if (!eligibility.eligible) continue;
 
     if (filters.buildings && filters.buildings.length > 0) {
@@ -245,8 +270,8 @@ const createDunningTask = async (params, operator) => {
   const {
     taskName,
     taskType = '手动',
-    dunningType,
-    dunningStage,
+    dunningType = '短信',
+    dunningStage = '提醒期',
     templateId,
     filters = {},
     scheduledAt,
@@ -260,7 +285,8 @@ const createDunningTask = async (params, operator) => {
       throw new NotFoundError('模板不存在');
     }
   } else {
-    template = await selectTemplate(dunningType, dunningStage, filters.overdueLevels ? filters.overdueLevels[0] : null);
+    const overdueLv = filters.overdueLevels && filters.overdueLevels.length > 0 ? filters.overdueLevels[0] : null;
+    template = await selectTemplate(dunningType, dunningStage, overdueLv);
   }
 
   if (!template.isEnabled) {
@@ -270,23 +296,24 @@ const createDunningTask = async (params, operator) => {
   const items = await buildTaskFilters(filters);
 
   if (items.length === 0) {
-    throw new BusinessError('没有符合条件的催缴对象');
+    throw new BusinessError('没有符合条件的催缴对象（可能已全部催缴、被拉黑或在冷却期）');
   }
 
   const taskNo = generateNo('TASK');
+  const finalStage = dunningStage || template.dunningStage || '提醒期';
 
   const task = new DunningTask({
     taskNo,
     taskName,
     taskType,
     dunningType,
-    dunningStage,
+    dunningStage: finalStage,
     templateId: template._id,
     templateNo: template.templateNo,
     filters,
     items,
     totalCount: items.length,
-    status: scheduledAt ? '待执行' : (requiresApproval ? '待执行' : '待执行'),
+    status: scheduledAt ? '待执行' : '待执行',
     scheduledAt,
     requiresApproval,
     approvalStatus: requiresApproval ? '待审批' : '无需审批',
@@ -302,14 +329,15 @@ const createDunningTask = async (params, operator) => {
     targetType: 'DunningTask',
     targetId: task._id,
     targetNo: taskNo,
-    operationContent: `创建催缴任务 ${taskName}`,
+    operationContent: `创建催缴任务 ${taskName}，匹配 ${items.length} 户`,
     afterData: task.toObject(),
     operationResult: '成功'
   });
 
   return {
     task,
-    matchedCount: items.length
+    matchedCount: items.length,
+    template
   };
 };
 
@@ -318,27 +346,13 @@ const getDunningTasks = async (params) => {
   const sort = buildSortParams(params.sortBy, params.sortOrder);
   const query = {};
 
-  if (params.taskNo) {
-    query.taskNo = params.taskNo;
-  }
-  if (params.taskType) {
-    query.taskType = params.taskType;
-  }
-  if (params.dunningType) {
-    query.dunningType = params.dunningType;
-  }
-  if (params.dunningStage) {
-    query.dunningStage = params.dunningStage;
-  }
-  if (params.status) {
-    query.status = params.status;
-  }
-  if (params.approvalStatus) {
-    query.approvalStatus = params.approvalStatus;
-  }
-  if (params.createdBy) {
-    query.createdBy = params.createdBy;
-  }
+  if (params.taskNo) query.taskNo = params.taskNo;
+  if (params.taskType) query.taskType = params.taskType;
+  if (params.dunningType) query.dunningType = params.dunningType;
+  if (params.dunningStage) query.dunningStage = params.dunningStage;
+  if (params.status) query.status = params.status;
+  if (params.approvalStatus) query.approvalStatus = params.approvalStatus;
+  if (params.createdBy) query.createdBy = params.createdBy;
   if (params.startDate && params.endDate) {
     query.createdAt = {
       $gte: new Date(params.startDate),
@@ -348,7 +362,7 @@ const getDunningTasks = async (params) => {
 
   const [tasks, total] = await Promise.all([
     DunningTask.find(query)
-      .populate('templateId', 'templateName templateType')
+      .populate('templateId', 'templateName channel templateType')
       .sort(sort)
       .skip(skip)
       .limit(pageSize),
@@ -359,13 +373,10 @@ const getDunningTasks = async (params) => {
 };
 
 const getDunningTaskDetail = async (taskId) => {
-  const task = await DunningTask.findById(taskId)
-    .populate('templateId');
-
+  const task = await DunningTask.findById(taskId).populate('templateId');
   if (!task) {
     throw new NotFoundError('催缴任务不存在');
   }
-
   return task;
 };
 
@@ -401,20 +412,25 @@ const executeDunningTask = async (taskId, operator) => {
       const resident = item.residentId ? await Resident.findById(item.residentId) : null;
 
       const renderData = {
-        residentName: item.residentName,
-        houseNo: item.houseNo,
-        building: house ? house.building : '',
-        unit: house ? house.unit : '',
-        roomNo: house ? house.roomNo : '',
-        totalArrears: item.totalArrears.toFixed(2),
-        overdueDays: item.overdueDays,
-        overdueLevel: item.overdueLevel,
-        currentDate: moment().format('YYYY年MM月DD日')
+        '业主姓名': item.residentName,
+        '房屋地址': item.houseNo,
+        '房屋信息': item.houseNo,
+        '欠费金额': item.totalArrears.toFixed(2),
+        '逾期天数': item.overdueDays,
+        '逾期等级': item.overdueLevel,
+        '当前日期': moment().format('YYYY年MM月DD日'),
+        '截止日期': moment().add(7, 'days').format('YYYY年MM月DD日'),
+        '承诺日期': resident && resident.promisedPaymentDate ? moment(resident.promisedPaymentDate).format('YYYY年MM月DD日') : '',
+        '客服姓名': operator || '客服专员',
+        '缴费金额': item.totalArrears.toFixed(2),
+        '上门记录': '上门沟通，业主表示将尽快缴费'
       };
 
       const { title, content } = renderTemplate(template, renderData);
 
       const queueNo = generateNo('MSG');
+      const priorityVal = task.dunningStage === '法律期' ? 3 : task.dunningStage === '严厉期' ? 2 : task.dunningStage === '催告期' ? 1 : 0;
+
       const queueItem = new MessageQueue({
         queueNo,
         taskId: task._id,
@@ -427,12 +443,12 @@ const executeDunningTask = async (taskId, operator) => {
         houseNo: item.houseNo,
         residentId: item.residentId,
         residentName: item.residentName,
-        phone: item.residentPhone,
+        phone: item.residentPhone || '13800000000',
         title,
         content,
         feeIds: item.feeIds,
         totalArrears: item.totalArrears,
-        priority: task.dunningStage === '法律期' ? 3 : task.dunningStage === '严厉期' ? 2 : task.dunningStage === '催告期' ? 1 : 0,
+        priority: priorityVal,
         status: '待发送',
         scheduledAt: task.scheduledAt || new Date(),
         createdBy: operator
@@ -455,7 +471,7 @@ const executeDunningTask = async (taskId, operator) => {
       });
 
     } catch (error) {
-      logger.error(`创建催缴消息失败: ${error.message}`, error);
+      logger.error(`创建催缴消息失败 [${item.houseNo}]: ${error.message}`, error);
       task.items[i].status = '失败';
       task.items[i].remark = error.message;
       failedCount++;
@@ -475,7 +491,7 @@ const executeDunningTask = async (taskId, operator) => {
     targetType: 'DunningTask',
     targetId: task._id,
     targetNo: task.taskNo,
-    operationContent: `执行催缴任务 ${task.taskName}`,
+    operationContent: `执行催缴任务 ${task.taskName}，成功 ${successCount} 条，失败 ${failedCount} 条`,
     operationResult: '成功'
   });
 
@@ -489,21 +505,34 @@ const executeDunningTask = async (taskId, operator) => {
 
 const batchGenerateReminders = async (filters, dunningType, operator) => {
   const stageFilters = [
-    { name: '提醒期', minDays: 1, maxDays: 89 },
-    { name: '催告期', minDays: 90, maxDays: 179 },
-    { name: '严厉期', minDays: 180, maxDays: 364 },
-    { name: '法律期', minDays: 365, maxDays: 9999 }
+    { name: '提醒期', minDays: 1, maxDays: 89, level: '一级' },
+    { name: '催告期', minDays: 90, maxDays: 179, level: '二级' },
+    { name: '严厉期', minDays: 180, maxDays: 364, level: '三级' },
+    { name: '法律期', minDays: 365, maxDays: 99999, level: '三级' }
   ];
 
   const results = [];
 
   for (const stage of stageFilters) {
     try {
-      const template = await selectTemplate(dunningType, stage.name, null);
-      if (!template) continue;
+      let template;
+      try {
+        template = await selectTemplate(dunningType, stage.name, stage.level);
+      } catch (e) {
+        try {
+          template = await selectTemplate(dunningType, stage.name, null);
+        } catch (e2) {
+          results.push({
+            stage: stage.name,
+            success: false,
+            error: `未找到${stage.name}模板`
+          });
+          continue;
+        }
+      }
 
       const result = await createDunningTask({
-        taskName: `${stage.name}批量催缴-${moment().format('YYYY-MM-DD')}`,
+        taskName: `${stage.name}${dunningType}批量催缴-${moment().format('YYYY-MM-DD HH:mm')}`,
         taskType: '自动',
         dunningType,
         dunningStage: stage.name,
@@ -518,15 +547,24 @@ const batchGenerateReminders = async (filters, dunningType, operator) => {
       results.push({
         stage: stage.name,
         taskNo: result.task.taskNo,
+        taskId: result.task._id,
         matchedCount: result.matchedCount,
+        templateName: template.templateName,
         success: true
       });
     } catch (error) {
-      if (error.code !== 'NOT_FOUND') {
+      if (error.message && error.message.indexOf('没有符合条件') === -1) {
         results.push({
           stage: stage.name,
           success: false,
           error: error.message
+        });
+      } else {
+        results.push({
+          stage: stage.name,
+          success: true,
+          matchedCount: 0,
+          note: error.message || '无符合条件数据'
         });
       }
     }
@@ -540,27 +578,13 @@ const getMessageQueue = async (params) => {
   const sort = buildSortParams(params.sortBy, params.sortOrder);
   const query = {};
 
-  if (params.queueNo) {
-    query.queueNo = params.queueNo;
-  }
-  if (params.taskId) {
-    query.taskId = params.taskId;
-  }
-  if (params.taskNo) {
-    query.taskNo = params.taskNo;
-  }
-  if (params.houseNo) {
-    query.houseNo = params.houseNo;
-  }
-  if (params.messageType) {
-    query.messageType = params.messageType;
-  }
-  if (params.status) {
-    query.status = params.status;
-  }
-  if (params.platformMsgId) {
-    query.platformMsgId = params.platformMsgId;
-  }
+  if (params.queueNo) query.queueNo = params.queueNo;
+  if (params.taskId) query.taskId = params.taskId;
+  if (params.taskNo) query.taskNo = params.taskNo;
+  if (params.houseNo) query.houseNo = params.houseNo;
+  if (params.messageType) query.messageType = params.messageType;
+  if (params.status) query.status = params.status;
+  if (params.platformMsgId) query.platformMsgId = params.platformMsgId;
   if (params.startDate && params.endDate) {
     query.createdAt = {
       $gte: new Date(params.startDate),

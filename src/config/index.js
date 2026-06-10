@@ -6,8 +6,9 @@ const config = {
     env: process.env.NODE_ENV || 'development'
   },
   database: {
-    uri: process.env.MONGODB_URI || 'mongodb://localhost:27017/property_dunning',
-    options: JSON.parse(process.env.MONGODB_OPTIONS || '{"useNewUrlParser":true,"useUnifiedTopology":true}')
+    url: process.env.DATABASE_URL || process.env.MONGODB_URI || 'mongodb://localhost:27017/property_fee_dunning',
+    uri: process.env.DATABASE_URL || process.env.MONGODB_URI || 'mongodb://localhost:27017/property_fee_dunning',
+    options: JSON.parse(process.env.MONGODB_OPTIONS || '{}')
   },
   logging: {
     level: process.env.LOG_LEVEL || 'info',

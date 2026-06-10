@@ -1,12 +1,21 @@
 const mongoose = require('mongoose');
+const { generateNo } = require('../utils/common');
 
 const residentSchema = new mongoose.Schema({
   residentNo: {
     type: String,
-    required: true,
     unique: true,
     index: true
   },
+  houseId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'House',
+    index: true
+  },
+  houseIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'House'
+  }],
   name: {
     type: String,
     required: true
@@ -25,10 +34,6 @@ const residentSchema = new mongoose.Schema({
   address: {
     type: String
   },
-  houseIds: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'House'
-  }],
   isBlacklist: {
     type: Boolean,
     default: false,
@@ -43,6 +48,10 @@ const residentSchema = new mongoose.Schema({
   complaintCount: {
     type: Number,
     default: 0
+  },
+  isInComplaintHandling: {
+    type: Boolean,
+    default: false
   },
   lastComplaintTime: {
     type: Date
@@ -78,8 +87,14 @@ const residentSchema = new mongoose.Schema({
   }
 });
 
-residentSchema.pre('save', function(next) {
+residentSchema.pre('save', function (next) {
   this.updatedAt = Date.now();
+  if (!this.residentNo) {
+    this.residentNo = generateNo('RES');
+  }
+  if (this.houseId && (!this.houseIds || this.houseIds.length === 0)) {
+    this.houseIds = [this.houseId];
+  }
   next();
 });
 

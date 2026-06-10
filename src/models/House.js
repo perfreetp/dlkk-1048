@@ -16,6 +16,9 @@ const houseSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  floor: {
+    type: Number
+  },
   roomNo: {
     type: String,
     required: true
@@ -23,6 +26,11 @@ const houseSchema = new mongoose.Schema({
   area: {
     type: Number,
     required: true
+  },
+  propertyType: {
+    type: String,
+    enum: ['住宅', '商铺', '写字楼', '车位'],
+    default: '住宅'
   },
   houseType: {
     type: String,
@@ -44,9 +52,11 @@ const houseSchema = new mongoose.Schema({
     enum: ['已收房', '未收房', '空置', '已转让'],
     default: '已收房'
   },
+  deliveryDate: {
+    type: Date
+  },
   propertyFeeStandard: {
-    type: Number,
-    required: true
+    type: Number
   },
   createdBy: {
     type: String
@@ -61,8 +71,14 @@ const houseSchema = new mongoose.Schema({
   }
 });
 
-houseSchema.pre('save', function(next) {
+houseSchema.pre('save', function (next) {
   this.updatedAt = Date.now();
+  if (!this.houseType && this.propertyType) {
+    this.houseType = this.propertyType;
+  }
+  if (!this.propertyType && this.houseType) {
+    this.propertyType = this.houseType;
+  }
   next();
 });
 

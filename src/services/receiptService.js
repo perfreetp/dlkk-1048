@@ -216,8 +216,28 @@ const syncPayment = async (params, operator) => {
 
   const paymentNo = generateNo('PAY');
 
-  const session = await PaymentRecord.startSession();
-  session.startTransaction();
+  let session = null;
+  let useTransaction = true;
+
+  try {
+    session = await PaymentRecord.startSession();
+    session.startTransaction();
+    const testRecord = new PaymentRecord({ paymentNo: `TEST-${Date.now()}` });
+    try {
+      await testRecord.save({ session });
+      await session.abortTransaction();
+      session = await PaymentRecord.startSession();
+      session.startTransaction();
+    } catch (txTestErr) {
+      useTransaction = false;
+      try { session.endSession(); } catch (e) {}
+      session = null;
+      logger.warn('MongoDB不支持事务（standalone模式），将以非事务模式执行');
+    }
+  } catch (e) {
+    useTransaction = false;
+    logger.warn('MongoDB不支持事务，将以非事务模式执行: ' + e.message);
+  }
 
   try {
     const paymentRecord = new PaymentRecord({
@@ -241,7 +261,24 @@ const syncPayment = async (params, operator) => {
       createdBy: operator
     });
 
-    await paymentRecord.save({ session });
+    try {
+      if (useTransaction && session) {
+        await paymentRecord.save({ session });
+      } else {
+        await paymentRecord.save();
+      }
+    } catch (saveErr) {
+      if (useTransaction && saveErr && saveErr.code === 20) {
+        useTransaction = false;
+        try { session.abortTransaction(); } catch (e) {}
+        try { session.endSession(); } catch (e) {}
+        session = null;
+        logger.warn('事务执行失败，降级为非事务模式');
+        await paymentRecord.save();
+      } else {
+        throw saveErr;
+      }
+    }
 
     let remainingAmount = paidAmount;
     const sortedFees = fees.sort((a, b) => a.dueDate - b.dueDate);
@@ -250,26 +287,40 @@ const syncPayment = async (params, operator) => {
       if (remainingAmount <= 0) break;
 
       const paymentForThisFee = Math.min(remainingAmount, fee.unpaidAmount);
-      fee.paidAmount += paymentForThisFee;
-      fee.unpaidAmount = fee.totalAmount - fee.paidAmount;
+      fee.paidAmount = Number((fee.paidAmount + paymentForThisFee).toFixed(2));
+      fee.unpaidAmount = Number((fee.totalAmount - fee.paidAmount).toFixed(2));
       fee.lastPaymentDate = paymentDate || new Date();
 
       if (fee.unpaidAmount <= 0) {
-        fee.paymentStatus = '已缴';
+        fee.paymentStatus = '已结清';
         fee.unpaidAmount = 0;
       } else {
         fee.paymentStatus = '部分缴';
       }
 
-      remainingAmount -= paymentForThisFee;
-      await fee.save({ session });
+      remainingAmount = Number((remainingAmount - paymentForThisFee).toFixed(2));
+      if (useTransaction && session) {
+        await fee.save({ session });
+      } else {
+        await fee.save();
+      }
+    }
+
+    if (useTransaction && session) {
+      try {
+        await session.commitTransaction();
+      } catch (commitErr) {
+        if (commitErr && commitErr.code === 20) {
+          logger.warn('事务提交不支持，已以非事务方式保存');
+        } else {
+          throw commitErr;
+        }
+      }
     }
 
     if (house.residentId) {
       await updateResidentArrearsInfo(house.residentId);
     }
-
-    await session.commitTransaction();
 
     await logOperation({
       operator,
@@ -290,10 +341,14 @@ const syncPayment = async (params, operator) => {
     };
 
   } catch (error) {
-    await session.abortTransaction();
+    if (useTransaction && session) {
+      try { await session.abortTransaction(); } catch (e) {}
+    }
     throw error;
   } finally {
-    session.endSession();
+    if (session) {
+      try { session.endSession(); } catch (e) {}
+    }
   }
 };
 

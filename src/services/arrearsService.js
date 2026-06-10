@@ -37,7 +37,7 @@ const updateResidentArrearsInfo = async (residentId) => {
   const fees = await PropertyFee.find({
     residentId,
     unpaidAmount: { $gt: 0 },
-    paymentStatus: { $in: ['未缴', '部分缴'] }
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] }
   });
 
   const totalArrears = fees.reduce((sum, fee) => sum + fee.unpaidAmount, 0);
@@ -158,7 +158,7 @@ const getHouseArrearsDetail = async (houseNo) => {
   const fees = await PropertyFee.find({
     houseId: house._id,
     unpaidAmount: { $gt: 0 },
-    paymentStatus: { $in: ['未缴', '部分缴'] }
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] }
   }).sort({ dueDate: 1 });
 
   for (const fee of fees) {
@@ -231,7 +231,7 @@ const getResidentArrearsDetail = async (residentId) => {
   const fees = await PropertyFee.find({
     houseId: { $in: houseIds },
     unpaidAmount: { $gt: 0 },
-    paymentStatus: { $in: ['未缴', '部分缴'] }
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] }
   }).populate('houseId', 'houseNo building unit roomNo');
 
   for (const fee of fees) {
@@ -278,15 +278,18 @@ const recalculateFee = async (feeId, params, operator) => {
     throw new NotFoundError('费用记录不存在');
   }
 
-  if (fee.paymentStatus === '已缴') {
+  if (fee.paymentStatus === '已缴' || fee.paymentStatus === '已结清') {
     throw new BusinessError('已缴费用不能重算');
   }
 
   const oldAmount = fee.totalAmount;
   const oldData = fee.toObject();
 
+  if (params.billingArea !== undefined) {
+    fee.billingArea = params.billingArea;
+  }
   if (params.area !== undefined) {
-    fee.area = params.area;
+    fee.billingArea = params.area;
   }
   if (params.unitPrice !== undefined) {
     fee.unitPrice = params.unitPrice;
@@ -301,7 +304,7 @@ const recalculateFee = async (feeId, params, operator) => {
     fee.dueDate = params.dueDate;
   }
 
-  fee.totalAmount = fee.area * fee.unitPrice + fee.lateFee - fee.discountAmount;
+  fee.totalAmount = fee.billingArea * fee.unitPrice + (fee.lateFee || 0) - (fee.discountAmount || 0);
   fee.unpaidAmount = fee.totalAmount - fee.paidAmount;
 
   const recalculationRecord = {
@@ -349,7 +352,7 @@ const recalculateFee = async (feeId, params, operator) => {
 
 const batchRecalculateFees = async (filters, params, operator) => {
   const query = {
-    paymentStatus: { $in: ['未缴', '部分缴'] }
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] }
   };
 
   if (filters.houseNos && filters.houseNos.length > 0) {
@@ -402,7 +405,7 @@ const batchRecalculateFees = async (filters, params, operator) => {
 
 const batchRefreshOverdueStatus = async () => {
   const fees = await PropertyFee.find({
-    paymentStatus: { $in: ['未缴', '部分缴'] },
+    paymentStatus: { $in: ['未结清', '部分缴', '未缴'] },
     unpaidAmount: { $gt: 0 }
   });
 
